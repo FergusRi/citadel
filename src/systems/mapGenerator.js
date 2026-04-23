@@ -16,6 +16,15 @@ const ROCK_HEIGHT  =  1.8;
 const MIN_WATER_REGION = 6;
 const MIN_ROCK_REGION  = 4;
 
+// Slope category constants
+export const SLOPE_FLAT   = 0;
+export const SLOPE_GENTLE = 1;
+export const SLOPE_STEEP  = 2;
+
+// Slope thresholds (gradient magnitude — rise over run in world units)
+const SLOPE_FLAT_MAX   = 0.15; // gradient ≤ this → flat
+const SLOPE_GENTLE_MAX = 0.45; // gradient ≤ this → gentle, else steep
+
 function noise(x, z, seed) {
   return (
     Math.sin(x * 0.15 + seed)       * Math.cos(z * 0.15 + seed)       * 2.5 +
@@ -83,6 +92,20 @@ function dominantNeighbourType(grid, cols, rows, region, regionType) {
   return parseInt(Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0]);
 }
 
+// Compute gradient magnitude at (col, row) using central differences on the height array.
+// cellSize is the world-space distance between adjacent grid vertices.
+function computeGradient(heights, cols, rows, col, row, cellSize) {
+  const idx = (c, r) => r * cols + c;
+
+  const c0 = Math.max(0, col - 1), c1 = Math.min(cols - 1, col + 1);
+  const r0 = Math.max(0, row - 1), r1 = Math.min(rows - 1, row + 1);
+
+  const dx = (heights[idx(c1, row)] - heights[idx(c0, row)]) / ((c1 - c0) * cellSize);
+  const dz = (heights[idx(col, r1)] - heights[idx(col, r0)]) / ((r1 - r0) * cellSize);
+
+  return Math.sqrt(dx * dx + dz * dz);
+}
+
 export class MapGenerator {
   constructor(scene, seed = 1) {
     this.scene          = scene;
@@ -90,6 +113,8 @@ export class MapGenerator {
     this._resourceNodes = [];
     this._buildableGrid = new Map(); // "x,z" -> true
     this._typeGrid      = null;      // Uint8Array [col + row*cols], after generate()
+    this._slopeGrid     = null;      // Uint8Array [col + row*cols], SLOPE_* values
+    this._slopeValues   = null;      // Float32Array [col + row*cols], raw gradient magnitudes
     this._gridCols      = SEGMENTS + 1;
     this._gridRows      = SEGMENTS + 1;
   }
@@ -112,6 +137,22 @@ export class MapGenerator {
     return this._typeGrid[r * this._gridCols + c];
   }
 
+  // Returns slope category (SLOPE_FLAT / SLOPE_GENTLE / SLOPE_STEEP) for a vertex grid position
+  getSlopeType(col, row) {
+    if (!this._slopeGrid) return SLOPE_FLAT;
+    const c = Math.max(0, Math.min(this._gridCols - 1, col));
+    const r = Math.max(0, Math.min(this._gridRows - 1, row));
+    return this._slopeGrid[r * this._gridCols + c];
+  }
+
+  // Returns raw gradient magnitude for a vertex grid position
+  getSlopeValue(col, row) {
+    if (!this._slopeValues) return 0;
+    const c = Math.max(0, Math.min(this._gridCols - 1, col));
+    const r = Math.max(0, Math.min(this._gridRows - 1, row));
+    return this._slopeValues[r * this._gridCols + c];
+  }
+
   generate() {
     this._buildTerrain();
     this._markClearings();
@@ -126,11 +167,11 @@ export class MapGenerator {
     const geo  = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE, SEGMENTS, SEGMENTS);
     geo.rotateX(-Math.PI / 2);
 
-    const pos       = geo.attributes.position;
-    const heights   = new Float32Array(pos.count);
-    const typeGrid  = new Uint8Array(cols * rows);
+    const pos      = geo.attributes.position;
+    const heights  = new Float32Array(pos.count);
+    const typeGrid = new Uint8Array(cols * rows);
 
-    // --- Pass 1: compute heights and classify ---
+    // --- Pass 1: compute heights and classify terrain type ---
     for (let i = 0; i < pos.count; i++) {
       const x    = pos.getX(i);
       const z    = pos.getZ(i);
@@ -147,12 +188,30 @@ export class MapGenerator {
       else                                typeGrid[row * cols + col] = T_GRASS;
     }
 
-    // --- Pass 2: BFS region cleanup ---
+    // --- Pass 2: BFS terrain type cleanup ---
     this._cleanupRegions(typeGrid, cols, rows, T_WATER, MIN_WATER_REGION);
     this._cleanupRegions(typeGrid, cols, rows, T_ROCK,  MIN_ROCK_REGION);
     this._typeGrid = typeGrid;
 
-    // --- Pass 3: apply heights to geometry ---
+    // --- Pass 3: compute slope classification ---
+    const cellSize   = MAP_SIZE / SEGMENTS; // world-space distance between adjacent vertices
+    const slopeGrid  = new Uint8Array(cols * rows);
+    const slopeVals  = new Float32Array(cols * rows);
+
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < cols; col++) {
+        const grad = computeGradient(heights, cols, rows, col, row, cellSize);
+        const idx  = row * cols + col;
+        slopeVals[idx] = grad;
+        if      (grad <= SLOPE_FLAT_MAX)   slopeGrid[idx] = SLOPE_FLAT;
+        else if (grad <= SLOPE_GENTLE_MAX) slopeGrid[idx] = SLOPE_GENTLE;
+        else                               slopeGrid[idx] = SLOPE_STEEP;
+      }
+    }
+    this._slopeGrid   = slopeGrid;
+    this._slopeValues = slopeVals;
+
+    // --- Pass 4: apply heights to geometry ---
     for (let i = 0; i < pos.count; i++) {
       pos.setY(i, heights[i]);
     }
