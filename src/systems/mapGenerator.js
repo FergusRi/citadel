@@ -32,6 +32,12 @@ const SECONDARY_RADIUS_LARGE = 4;
 const SECONDARY_RADIUS_SMALL = 3;
 const MIN_CLEARING_CELLS     = 5;   // reject a candidate if fewer usable cells than this
 
+// Spawn validation thresholds
+const SPAWN_MIN_USABLE_CELLS   = 8;   // minimum flat/gentle non-water cells in clearing
+const SPAWN_MIN_FLAT_RATIO     = 0.5; // at least 50% of clearing cells must be flat or gentle
+const SPAWN_NEARBY_RADIUS      = 3;   // grid-cell radius to check for nearby buildable space
+const SPAWN_MIN_NEARBY_CELLS   = 4;   // minimum usable cells within nearby radius
+
 function noise(x, z, seed) {
   return (
     Math.sin(x * 0.15 + seed)       * Math.cos(z * 0.15 + seed)       * 2.5 +
@@ -120,6 +126,7 @@ export class MapGenerator {
     this._slopeValues   = null;       // Float32Array [col + row*cols]
     this._clearings     = [];         // array of clearing objects
     this._clearingMask  = new Set();  // "col,row" keys for fast lookup
+    this._spawnPoint    = null;        // validated world-space { x, z } spawn point
     this._gridCols      = SEGMENTS + 1;
     this._gridRows      = SEGMENTS + 1;
   }
@@ -158,10 +165,9 @@ export class MapGenerator {
     return this._slopeValues[r * this._gridCols + c];
   }
 
-  // Returns world-space center of the primary (starting) clearing
+  // Returns the validated spawn point: world-space { x, z } of the best start location
   getSpawnPoint() {
-    const primary = this._clearings.find(cl => cl.isPrimary);
-    return primary ? { x: primary.cx, z: primary.cz } : { x: 0, z: 0 };
+    return this._spawnPoint ? { ...this._spawnPoint } : { x: 0, z: 0 };
   }
 
   // Returns all clearing objects: { id, cx, cz, radius, cells, isPrimary }
@@ -177,6 +183,7 @@ export class MapGenerator {
   generate() {
     this._buildTerrain();
     this._generateClearings();
+    this._selectSpawnPoint();
     this._placeResourceNodes();
     this._placeWater();
     this._placeTrees();
@@ -365,6 +372,92 @@ export class MapGenerator {
         this._clearingMask.add(`${col},${row}`);
       }
     }
+  }
+
+  // Score a clearing for spawn suitability (higher = better).
+  // Returns null if the clearing fails minimum requirements.
+  _scoreClearing(clearing) {
+    let flatCount = 0;
+    let usableCount = 0;
+
+    for (const [col, row] of clearing.cells) {
+      const type  = this.getTerrainType(col, row);
+      const slope = this.getSlopeType(col, row);
+      if (type === T_WATER) continue;
+      usableCount++;
+      if (slope === SLOPE_FLAT || slope === SLOPE_GENTLE) flatCount++;
+    }
+
+    if (usableCount < SPAWN_MIN_USABLE_CELLS) return null;
+    const flatRatio = flatCount / usableCount;
+    if (flatRatio < SPAWN_MIN_FLAT_RATIO) return null;
+
+    // Check nearby buildable space around clearing centre
+    const { col: cc, row: cr } = this._worldToGrid(clearing.cx, clearing.cz);
+    let nearbyUsable = 0;
+    for (let dr = -SPAWN_NEARBY_RADIUS; dr <= SPAWN_NEARBY_RADIUS; dr++) {
+      for (let dc = -SPAWN_NEARBY_RADIUS; dc <= SPAWN_NEARBY_RADIUS; dc++) {
+        const nc = cc + dc, nr = cr + dr;
+        if (nc < 0 || nc >= this._gridCols || nr < 0 || nr >= this._gridRows) continue;
+        const type  = this.getTerrainType(nc, nr);
+        const slope = this.getSlopeType(nc, nr);
+        if (type !== T_WATER && slope !== SLOPE_STEEP) nearbyUsable++;
+      }
+    }
+    if (nearbyUsable < SPAWN_MIN_NEARBY_CELLS) return null;
+
+    // Score: weight usable cell count + flat ratio + nearby space
+    return usableCount * 1.0 + flatRatio * 10 + nearbyUsable * 0.5;
+  }
+
+  // Select and store the best validated spawn point from existing clearings.
+  // Prefers the primary clearing; falls back to highest-scoring secondary.
+  _selectSpawnPoint() {
+    let bestClearing = null;
+    let bestScore    = -Infinity;
+
+    for (const clearing of this._clearings) {
+      const score = this._scoreClearing(clearing);
+      if (score === null) continue;
+      // Bias primary clearing heavily so it wins unless genuinely poor
+      const adjusted = score + (clearing.isPrimary ? 50 : 0);
+      if (adjusted > bestScore) {
+        bestScore    = adjusted;
+        bestClearing = clearing;
+      }
+    }
+
+    if (!bestClearing) {
+      // Last resort: pick the usable cell closest to map centre across all clearings
+      let minDist = Infinity;
+      let bestCell = null;
+      for (const clearing of this._clearings) {
+        for (const [col, row] of clearing.cells) {
+          if (this.getTerrainType(col, row) === T_WATER) continue;
+          if (this.getSlopeType(col, row) === SLOPE_STEEP) continue;
+          const wx = (col - this._gridCols / 2 + 0.5) * CELL_SIZE;
+          const wz = (row - this._gridRows / 2 + 0.5) * CELL_SIZE;
+          const d  = wx * wx + wz * wz;
+          if (d < minDist) { minDist = d; bestCell = { x: wx, z: wz }; }
+        }
+      }
+      this._spawnPoint = bestCell ?? { x: 0, z: 0 };
+      return;
+    }
+
+    // Within the winning clearing, choose the usable cell nearest to its centre
+    let minDist = Infinity;
+    let spawnCell = { x: bestClearing.cx, z: bestClearing.cz };
+    for (const [col, row] of bestClearing.cells) {
+      if (this.getTerrainType(col, row) === T_WATER) continue;
+      if (this.getSlopeType(col, row) === SLOPE_STEEP) continue;
+      const wx = (col - this._gridCols / 2 + 0.5) * CELL_SIZE;
+      const wz = (row - this._gridRows / 2 + 0.5) * CELL_SIZE;
+      const dx = wx - bestClearing.cx, dz = wz - bestClearing.cz;
+      const d  = dx * dx + dz * dz;
+      if (d < minDist) { minDist = d; spawnCell = { x: wx, z: wz }; }
+    }
+    this._spawnPoint = spawnCell;
   }
 
   _placeResourceNodes() {
