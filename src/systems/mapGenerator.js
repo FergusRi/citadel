@@ -2,6 +2,7 @@ import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.m
 
 const MAP_SIZE = 60;
 const SEGMENTS = 60;
+const CELL_SIZE = MAP_SIZE / SEGMENTS; // world-space distance between adjacent vertices (= 1.0)
 
 // Terrain type constants
 const T_GRASS = 0;
@@ -22,8 +23,14 @@ export const SLOPE_GENTLE = 1;
 export const SLOPE_STEEP  = 2;
 
 // Slope thresholds (gradient magnitude — rise over run in world units)
-const SLOPE_FLAT_MAX   = 0.15; // gradient ≤ this → flat
-const SLOPE_GENTLE_MAX = 0.45; // gradient ≤ this → gentle, else steep
+const SLOPE_FLAT_MAX   = 0.15;
+const SLOPE_GENTLE_MAX = 0.45;
+
+// Clearing generation settings
+const PRIMARY_RADIUS         = 6;   // cell radius of starting clearing
+const SECONDARY_RADIUS_LARGE = 4;
+const SECONDARY_RADIUS_SMALL = 3;
+const MIN_CLEARING_CELLS     = 5;   // reject a candidate if fewer usable cells than this
 
 function noise(x, z, seed) {
   return (
@@ -92,17 +99,13 @@ function dominantNeighbourType(grid, cols, rows, region, regionType) {
   return parseInt(Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0]);
 }
 
-// Compute gradient magnitude at (col, row) using central differences on the height array.
-// cellSize is the world-space distance between adjacent grid vertices.
+// Compute gradient magnitude at (col, row) using central differences on the height array
 function computeGradient(heights, cols, rows, col, row, cellSize) {
   const idx = (c, r) => r * cols + c;
-
   const c0 = Math.max(0, col - 1), c1 = Math.min(cols - 1, col + 1);
   const r0 = Math.max(0, row - 1), r1 = Math.min(rows - 1, row + 1);
-
   const dx = (heights[idx(c1, row)] - heights[idx(c0, row)]) / ((c1 - c0) * cellSize);
   const dz = (heights[idx(col, r1)] - heights[idx(col, r0)]) / ((r1 - r0) * cellSize);
-
   return Math.sqrt(dx * dx + dz * dz);
 }
 
@@ -111,10 +114,12 @@ export class MapGenerator {
     this.scene          = scene;
     this.seed           = seed;
     this._resourceNodes = [];
-    this._buildableGrid = new Map(); // "x,z" -> true
-    this._typeGrid      = null;      // Uint8Array [col + row*cols], after generate()
-    this._slopeGrid     = null;      // Uint8Array [col + row*cols], SLOPE_* values
-    this._slopeValues   = null;      // Float32Array [col + row*cols], raw gradient magnitudes
+    this._buildableGrid = new Map();  // "worldX,worldZ" -> true
+    this._typeGrid      = null;       // Uint8Array [col + row*cols]
+    this._slopeGrid     = null;       // Uint8Array [col + row*cols]
+    this._slopeValues   = null;       // Float32Array [col + row*cols]
+    this._clearings     = [];         // array of clearing objects
+    this._clearingMask  = new Set();  // "col,row" keys for fast lookup
     this._gridCols      = SEGMENTS + 1;
     this._gridRows      = SEGMENTS + 1;
   }
@@ -153,9 +158,25 @@ export class MapGenerator {
     return this._slopeValues[r * this._gridCols + c];
   }
 
+  // Returns world-space center of the primary (starting) clearing
+  getSpawnPoint() {
+    const primary = this._clearings.find(cl => cl.isPrimary);
+    return primary ? { x: primary.cx, z: primary.cz } : { x: 0, z: 0 };
+  }
+
+  // Returns all clearing objects: { id, cx, cz, radius, cells, isPrimary }
+  getClearings() {
+    return this._clearings;
+  }
+
+  // Returns true if the vertex grid position is inside any clearing
+  isInClearing(col, row) {
+    return this._clearingMask.has(`${col},${row}`);
+  }
+
   generate() {
     this._buildTerrain();
-    this._markClearings();
+    this._generateClearings();
     this._placeResourceNodes();
     this._placeWater();
     this._placeTrees();
@@ -194,13 +215,12 @@ export class MapGenerator {
     this._typeGrid = typeGrid;
 
     // --- Pass 3: compute slope classification ---
-    const cellSize   = MAP_SIZE / SEGMENTS; // world-space distance between adjacent vertices
-    const slopeGrid  = new Uint8Array(cols * rows);
-    const slopeVals  = new Float32Array(cols * rows);
+    const slopeGrid = new Uint8Array(cols * rows);
+    const slopeVals = new Float32Array(cols * rows);
 
     for (let row = 0; row < rows; row++) {
       for (let col = 0; col < cols; col++) {
-        const grad = computeGradient(heights, cols, rows, col, row, cellSize);
+        const grad = computeGradient(heights, cols, rows, col, row, CELL_SIZE);
         const idx  = row * cols + col;
         slopeVals[idx] = grad;
         if      (grad <= SLOPE_FLAT_MAX)   slopeGrid[idx] = SLOPE_FLAT;
@@ -218,7 +238,7 @@ export class MapGenerator {
     pos.needsUpdate = true;
     geo.computeVertexNormals();
 
-    // Build per-vertex colour array based on cleaned type grid
+    // Per-vertex colours from terrain type
     const colors = new Float32Array(pos.count * 3);
     const grassC = new THREE.Color(0x3a5a2a);
     const waterC = new THREE.Color(0x1a6688);
@@ -258,23 +278,93 @@ export class MapGenerator {
     }
   }
 
-  _markClearings() {
-    for (let x = -5; x <= 5; x++)
-      for (let z = -5; z <= 5; z++)
-        this._buildableGrid.set(`${x},${z}`, true);
+  // Convert world-space coords to vertex grid col/row
+  _worldToGrid(wx, wz) {
+    return {
+      col: Math.round((wx + MAP_SIZE / 2) / CELL_SIZE),
+      row: Math.round((wz + MAP_SIZE / 2) / CELL_SIZE),
+    };
+  }
 
-    const clearings = [
-      { cx: 10, cz: 8,   r: 3 },
-      { cx: -12, cz: 6,  r: 2 },
-      { cx: 8,  cz: -10, r: 3 },
-      { cx: -9, cz: -9,  r: 2 },
+  // Perturb a base radius by angle to produce a natural, irregular outline
+  _perturbRadius(base, angle, seedOff) {
+    return base * (
+      1 +
+      0.28 * Math.sin(angle * 2.7 + seedOff * 0.11) *
+             Math.cos(angle * 1.4 + seedOff * 0.07)
+    );
+  }
+
+  // Build a single clearing centred at world (cx, cz).
+  // isPrimary clearings allow steep cells (centre is already forced flat by height generation).
+  // Returns a clearing object or null if the location is unusable.
+  _buildClearing(cx, cz, radius, isPrimary, id) {
+    const seedOff = this.seed + cx * 13.7 + cz * 7.3;
+    const maxR    = Math.ceil(radius * 1.45);
+    const cells   = [];
+
+    for (let dz = -maxR; dz <= maxR; dz++) {
+      for (let dx = -maxR; dx <= maxR; dx++) {
+        const wx = cx + dx * CELL_SIZE;
+        const wz = cz + dz * CELL_SIZE;
+        const { col, row } = this._worldToGrid(wx, wz);
+
+        if (col < 0 || col >= this._gridCols || row < 0 || row >= this._gridRows) continue;
+
+        const dist  = Math.sqrt(dx * dx + dz * dz);
+        const angle = Math.atan2(dz, dx);
+        const r     = this._perturbRadius(radius, angle, seedOff);
+
+        if (dist > r) continue;
+
+        // Terrain checks — water is always excluded; steep only rejected for secondaries
+        if (this.getTerrainType(col, row) === T_WATER) continue;
+        if (!isPrimary && this.getSlopeType(col, row) === SLOPE_STEEP) continue;
+
+        cells.push([col, row]);
+      }
+    }
+
+    if (cells.length < MIN_CLEARING_CELLS) return null;
+
+    return { id, cx, cz, radius, cells, isPrimary };
+  }
+
+  // Generate all clearings, populate _buildableGrid and _clearingMask
+  _generateClearings() {
+    const clearings = [];
+
+    // Primary clearing — always at map centre (height generation forces it flat)
+    const primary = this._buildClearing(0, 0, PRIMARY_RADIUS, true, 'primary');
+    if (primary) clearings.push(primary);
+
+    // Secondary candidate positions in world space
+    const candidates = [
+      { cx:  10, cz:  8,   r: SECONDARY_RADIUS_LARGE, id: 'sec_0' },
+      { cx: -12, cz:  6,   r: SECONDARY_RADIUS_SMALL, id: 'sec_1' },
+      { cx:   8, cz: -10,  r: SECONDARY_RADIUS_LARGE, id: 'sec_2' },
+      { cx:  -9, cz:  -9,  r: SECONDARY_RADIUS_SMALL, id: 'sec_3' },
+      { cx:  16, cz:  -5,  r: SECONDARY_RADIUS_SMALL, id: 'sec_4' },
+      { cx:  -5, cz:  16,  r: SECONDARY_RADIUS_SMALL, id: 'sec_5' },
     ];
-    clearings.forEach(({ cx, cz, r }) => {
-      for (let x = cx - r; x <= cx + r; x++)
-        for (let z = cz - r; z <= cz + r; z++)
-          if ((x - cx) ** 2 + (z - cz) ** 2 <= r * r)
-            this._buildableGrid.set(`${x},${z}`, true);
-    });
+
+    for (const { cx, cz, r, id } of candidates) {
+      const clearing = this._buildClearing(cx, cz, r, false, id);
+      if (clearing) clearings.push(clearing);
+    }
+
+    this._clearings    = clearings;
+    this._clearingMask = new Set();
+
+    for (const clearing of clearings) {
+      for (const [col, row] of clearing.cells) {
+        // _buildableGrid key uses world-integer coords (col - 30 = worldX since CELL_SIZE=1)
+        const worldX = col - this._gridCols / 2 + 0.5 | 0;
+        const worldZ = row - this._gridRows / 2 + 0.5 | 0;
+        this._buildableGrid.set(`${worldX},${worldZ}`, true);
+        this._clearingMask.add(`${col},${row}`);
+      }
+    }
   }
 
   _placeResourceNodes() {
