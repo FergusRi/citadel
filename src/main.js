@@ -2,26 +2,37 @@ import { Renderer } from './systems/renderer.js';
 import { CameraSystem } from './systems/camera.js';
 import { MapGenerator } from './systems/mapGenerator.js';
 import { GameState } from './systems/gameState.js';
+import { Context } from './context.js';
+import { Settlement } from './systems/settlement.js';
 
 const canvas = document.getElementById('game-canvas');
 
-const renderer = new Renderer(canvas);
-const camera = new CameraSystem(renderer.getCamera(), renderer.getDomElement());
+// Read seed from URL param (?seed=1234) for reproducibility, else random.
+const urlSeed = new URLSearchParams(window.location.search).get('seed');
+const seed = urlSeed !== null ? parseFloat(urlSeed) : Math.random() * 1_000_000;
+
+const renderer  = new Renderer(canvas);
 const gameState = new GameState();
-const mapGen = new MapGenerator(renderer.getScene());
+const mapGen    = new MapGenerator(renderer.getScene(), seed);
+const camera    = new CameraSystem(renderer.getCamera(), mapGen.bounds());
 
 mapGen.generate();
-camera.setMenuMode();
+
+const settlement = new Settlement(renderer.getScene(), gameState);
+settlement.spawnHall(mapGen.getSpawnPoint());
+
+gameState.setPhase('planning');
+camera.setGameMode();
+
+export const ctx = new Context({ renderer, camera, gameState, mapGen, settlement, seed });
 
 let lastTime = 0;
 
 function loop(timestamp) {
-  const delta = (timestamp - lastTime) / 1000;
+  const delta = Math.min((timestamp - lastTime) / 1000, 0.1);
   lastTime = timestamp;
-
   camera.update(delta);
   renderer.render();
-
   requestAnimationFrame(loop);
 }
 
