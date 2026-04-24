@@ -9,6 +9,10 @@ const T_GRASS = 0;
 const T_WATER = 1;
 const T_ROCK  = 2;
 
+// Resource type constants
+const R_WOOD  = 'wood';
+const R_STONE = 'stone';
+
 // Height thresholds for initial classification
 const WATER_HEIGHT = -0.8;
 const ROCK_HEIGHT  =  1.8;
@@ -460,26 +464,94 @@ export class MapGenerator {
     this._spawnPoint = spawnCell;
   }
 
+  // Deterministic pseudo-random value in [0, 1) from seed + index
+  _rng(idx) {
+    return Math.abs(Math.sin(this.seed * 9301 + idx * 49297 + 233)) % 1;
+  }
+
+  // Scatter `count` resource nodes within radius of (cx, cz).
+  // Skips water, steep terrain, and any cell in primarySet.
+  // Returns array of { wx, wz } world positions.
+  _placeResourceCluster(cx, cz, radius, count, clusterIdx, primarySet) {
+    const placed   = [];
+    const attempts = count * 10;
+    for (let i = 0; i < attempts && placed.length < count; i++) {
+      const angle = this._rng(clusterIdx * 500 + i * 17)      * Math.PI * 2;
+      const dist  = this._rng(clusterIdx * 500 + i * 17 + 7)  * radius;
+      const wx    = cx + Math.cos(angle) * dist;
+      const wz    = cz + Math.sin(angle) * dist;
+      const { col, row } = this._worldToGrid(wx, wz);
+      if (col < 0 || col >= this._gridCols || row < 0 || row >= this._gridRows) continue;
+      if (this.getTerrainType(col, row) === T_WATER)    continue;
+      if (this.getSlopeType(col, row)   === SLOPE_STEEP) continue;
+      if (primarySet.has(`${col},${row}`))              continue;
+      placed.push({ wx, wz });
+    }
+    return placed;
+  }
+
   _placeResourceNodes() {
-    const positions = [
-      { x: 14, z: 0 }, { x: -14, z: 2 }, { x: 0, z: 14 }, { x: 0, z: -14 },
-      { x: 10, z: 12 }, { x: -12, z: -10 },
-    ];
+    // Build exclusion set from the primary clearing so resources never land there
+    const primaryClearing = this._clearings.find(cl => cl.isPrimary);
+    const primarySet = new Set(
+      primaryClearing ? primaryClearing.cells.map(([c, r]) => `${c},${r}`) : []
+    );
+
     const treeMat  = new THREE.MeshLambertMaterial({ color: 0x2d6e2d });
     const trunkMat = new THREE.MeshLambertMaterial({ color: 0x5c3a1e });
+    const rockMat  = new THREE.MeshLambertMaterial({ color: 0x888880 });
 
-    positions.forEach(({ x, z }) => {
-      const node  = new THREE.Group();
-      const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.2, 1.2, 6), trunkMat);
-      trunk.position.y = 0.6;
-      const canopy = new THREE.Mesh(new THREE.ConeGeometry(0.9, 1.8, 7), treeMat);
-      canopy.position.y = 2.0;
-      node.add(trunk, canopy);
-      node.position.set(x, 0, z);
-      node.castShadow = true;
-      node.userData   = { type: 'wood', amount: 40, id: `node_${x}_${z}` };
-      this.scene.add(node);
-      this._resourceNodes.push(node);
+    // Wood: 5 clusters, medium radius, closer to centre
+    const woodClusters = [
+      { cx:  9,  cz:  7,  r: 5, n: 5 },
+      { cx: -11, cz:  7,  r: 4, n: 4 },
+      { cx:  6,  cz: -11, r: 5, n: 5 },
+      { cx: -7,  cz: -9,  r: 4, n: 4 },
+      { cx:  15, cz:  4,  r: 4, n: 4 },
+    ];
+
+    // Stone: 3 clusters, smaller radius, further from centre
+    const stoneClusters = [
+      { cx:  19, cz: -11, r: 3, n: 3 },
+      { cx: -17, cz:  13, r: 3, n: 3 },
+      { cx:  -1, cz:  20, r: 3, n: 2 },
+    ];
+
+    let nodeId = 0;
+
+    woodClusters.forEach((cl, ci) => {
+      const positions = this._placeResourceCluster(cl.cx, cl.cz, cl.r, cl.n, ci, primarySet);
+      for (const { wx, wz } of positions) {
+        const group  = new THREE.Group();
+        const trunk  = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.2, 1.2, 6), trunkMat);
+        trunk.position.y = 0.6;
+        const canopy = new THREE.Mesh(new THREE.ConeGeometry(0.9, 1.8, 7), treeMat);
+        canopy.position.y = 2.0;
+        group.add(trunk, canopy);
+        group.position.set(wx, 0, wz);
+        group.castShadow = true;
+        group.userData   = { type: R_WOOD, amount: 40, id: `res_wood_${nodeId++}` };
+        this.scene.add(group);
+        this._resourceNodes.push(group);
+      }
+    });
+
+    stoneClusters.forEach((cl, ci) => {
+      const positions = this._placeResourceCluster(
+        cl.cx, cl.cz, cl.r, cl.n, woodClusters.length + ci, primarySet
+      );
+      for (const { wx, wz } of positions) {
+        const group = new THREE.Group();
+        const rock  = new THREE.Mesh(new THREE.IcosahedronGeometry(0.6, 0), rockMat);
+        rock.position.y = 0.45;
+        rock.rotation.y = this._rng(nodeId * 31) * Math.PI;
+        group.add(rock);
+        group.position.set(wx, 0, wz);
+        group.castShadow = true;
+        group.userData   = { type: R_STONE, amount: 25, id: `res_stone_${nodeId++}` };
+        this.scene.add(group);
+        this._resourceNodes.push(group);
+      }
     });
   }
 
