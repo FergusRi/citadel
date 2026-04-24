@@ -6,6 +6,7 @@ import { Context } from './context.js';
 import { Settlement } from './systems/settlement.js';
 import { CitizenSystem } from './systems/citizens.js';
 import { BuildingPlacer } from './systems/buildingPlacer.js';
+import { EnemySystem } from './systems/enemySystem.js';
 
 const canvas = document.getElementById('game-canvas');
 
@@ -35,7 +36,10 @@ const buildingPlacer = new BuildingPlacer(
   renderer.getScene(), renderer.getCamera(), canvas, mapGen, gameState
 );
 
-export const ctx = new Context({ renderer, camera, gameState, mapGen, settlement, citizenSystem, buildingPlacer, seed });
+const enemySystem = new EnemySystem(renderer.getScene(), gameState);
+enemySystem.setHallPos(mapGen.getSpawnPoint());
+
+export const ctx = new Context({ renderer, camera, gameState, mapGen, settlement, citizenSystem, buildingPlacer, enemySystem, seed });
 
 let lastTime = 0;
 
@@ -44,6 +48,7 @@ function loop(timestamp) {
   lastTime = timestamp;
   camera.update(delta);
   citizenSystem.update(delta, gameState.phase);
+  enemySystem.update(delta);
   renderer.render();
   requestAnimationFrame(loop);
 }
