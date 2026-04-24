@@ -10,8 +10,8 @@ export class GameState {
   constructor() {
     this.phase = Phase.MENU;
     this.wave = 0;
-    this.resources = { wood: 50, food: 20 };
-    this.population = { current: 3, max: 5 };
+    this.resources = { wood: 30, stone: 0, food: 10 };
+    this.population = { current: 0, max: 5 };
     this.buildings = [];
     this.enemies = [];
     this.citizens = [];
