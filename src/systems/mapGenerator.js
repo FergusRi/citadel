@@ -36,6 +36,14 @@ const SECONDARY_RADIUS_LARGE = 4;
 const SECONDARY_RADIUS_SMALL = 3;
 const MIN_CLEARING_CELLS     = 5;   // reject a candidate if fewer usable cells than this
 
+// Map validation thresholds
+const VALID_MIN_BUILDABLE_CELLS = 20;   // contiguous usable cells reachable from spawn
+const VALID_WOOD_MIN_DIST       = 5;    // wood must be at least this far from spawn
+const VALID_WOOD_MAX_DIST       = 22;   // wood must be within this range
+const VALID_STONE_MIN_DIST      = 10;   // stone must require some expansion
+const VALID_STONE_MAX_DIST      = 28;   // stone must still be reachable
+const VALID_BFS_CAP             = 200;  // max cells to BFS from spawn (perf cap)
+
 // Spawn validation thresholds
 const SPAWN_MIN_USABLE_CELLS   = 8;   // minimum flat/gentle non-water cells in clearing
 const SPAWN_MIN_FLAT_RATIO     = 0.5; // at least 50% of clearing cells must be flat or gentle
@@ -179,18 +187,38 @@ export class MapGenerator {
     return this._clearings;
   }
 
+  // Returns true if the last generated map passed all validation checks
+  isValidMap() {
+    return this._validationResult ? this._validationResult.valid : false;
+  }
+
+  // Returns { valid: bool, reasons: string[] } from the most recent validation run
+  getValidationResult() {
+    return this._validationResult ? { ...this._validationResult } : null;
+  }
+
   // Returns true if the vertex grid position is inside any clearing
   isInClearing(col, row) {
     return this._clearingMask.has(`${col},${row}`);
   }
 
-  generate() {
-    this._buildTerrain();
-    this._generateClearings();
-    this._selectSpawnPoint();
-    this._placeResourceNodes();
-    this._placeWater();
-    this._placeTrees();
+  generate(maxRetries = 8) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      this._buildTerrain();
+      this._generateClearings();
+      this._selectSpawnPoint();
+      this._placeResourceNodes();
+      this._placeWater();
+      this._placeTrees();
+      if (this._validateMap()) return;
+      if (attempt < maxRetries - 1) {
+        this._clearScene();
+        this.seed += 1;
+      }
+    }
+    if (!this._validationResult) {
+      this._validationResult = { valid: false, reasons: ['max retries exhausted'] };
+    }
   }
 
   _buildTerrain() {
@@ -274,6 +302,7 @@ export class MapGenerator {
     mesh.name = 'terrain';
     this.scene.add(mesh);
     this.terrainMesh = mesh;
+    this._sceneObjects.push(mesh);
   }
 
   // Remove all regions of targetType smaller than minSize by converting to dominant neighbour
@@ -464,6 +493,100 @@ export class MapGenerator {
     this._spawnPoint = spawnCell;
   }
 
+  // Remove all tracked scene objects and reset map state so generation can retry
+  _clearScene() {
+    for (const obj of this._sceneObjects) {
+      this.scene.remove(obj);
+      obj.traverse(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+      });
+    }
+    this._sceneObjects     = [];
+    this._resourceNodes    = [];
+    this._buildableGrid    = new Map();
+    this._typeGrid         = null;
+    this._slopeGrid        = null;
+    this._slopeValues      = null;
+    this._clearings        = [];
+    this._clearingMask     = new Set();
+    this._spawnPoint       = null;
+    this._validationResult = null;
+    this.terrainMesh       = null;
+  }
+
+  // BFS from (startCol, startRow) counting contiguous non-water non-steep cells (capped)
+  _countReachableUsable(startCol, startRow) {
+    const visited = new Set();
+    const queue   = [[startCol, startRow]];
+    const key     = (c, r) => `${c},${r}`;
+    visited.add(key(startCol, startRow));
+    let count = 0;
+    while (queue.length > 0 && count < VALID_BFS_CAP) {
+      const [c, r] = queue.shift();
+      count++;
+      for (const [dc, dr] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+        const nc = c + dc, nr = r + dr;
+        if (nc < 0 || nc >= this._gridCols || nr < 0 || nr >= this._gridRows) continue;
+        const k = key(nc, nr);
+        if (visited.has(k)) continue;
+        if (this.getTerrainType(nc, nr) === T_WATER)     continue;
+        if (this.getSlopeType(nc, nr)   === SLOPE_STEEP) continue;
+        visited.add(k);
+        queue.push([nc, nr]);
+      }
+    }
+    return count;
+  }
+
+  // Run all validity checks; stores result in _validationResult. Returns true if map is playable.
+  _validateMap() {
+    const reasons = [];
+    const spawn   = this._spawnPoint ?? { x: 0, z: 0 };
+    const { col: sc, row: sr } = this._worldToGrid(spawn.x, spawn.z);
+
+    // Spawn terrain must be usable
+    if (this.getTerrainType(sc, sr) === T_WATER) {
+      reasons.push('spawn point is in water');
+    }
+    if (this.getSlopeType(sc, sr) === SLOPE_STEEP) {
+      reasons.push('spawn point is on steep terrain');
+    }
+
+    // Enough contiguous buildable space for early structures
+    const reachable = this._countReachableUsable(sc, sr);
+    if (reachable < VALID_MIN_BUILDABLE_CELLS) {
+      reasons.push(`insufficient buildable space: ${reachable} cells (need ${VALID_MIN_BUILDABLE_CELLS})`);
+    }
+
+    // Wood must be accessible but not crowding spawn
+    const woodNodes = this._resourceNodes.filter(n => n.userData.type === R_WOOD);
+    if (woodNodes.length === 0) {
+      reasons.push('no wood resources on map');
+    } else {
+      const inRange = woodNodes.filter(n => {
+        const d = Math.hypot(n.position.x - spawn.x, n.position.z - spawn.z);
+        return d >= VALID_WOOD_MIN_DIST && d <= VALID_WOOD_MAX_DIST;
+      });
+      if (inRange.length === 0) reasons.push('no wood within accessible range of spawn');
+    }
+
+    // Stone must exist and require some expansion to reach
+    const stoneNodes = this._resourceNodes.filter(n => n.userData.type === R_STONE);
+    if (stoneNodes.length === 0) {
+      reasons.push('no stone resources on map');
+    } else {
+      const inRange = stoneNodes.filter(n => {
+        const d = Math.hypot(n.position.x - spawn.x, n.position.z - spawn.z);
+        return d >= VALID_STONE_MIN_DIST && d <= VALID_STONE_MAX_DIST;
+      });
+      if (inRange.length === 0) reasons.push('no stone within strategic range of spawn');
+    }
+
+    this._validationResult = { valid: reasons.length === 0, reasons };
+    return this._validationResult.valid;
+  }
+
   // Deterministic pseudo-random value in [0, 1) from seed + index
   _rng(idx) {
     return Math.abs(Math.sin(this.seed * 9301 + idx * 49297 + 233)) % 1;
@@ -533,6 +656,7 @@ export class MapGenerator {
         group.userData   = { type: R_WOOD, amount: 40, id: `res_wood_${nodeId++}` };
         this.scene.add(group);
         this._resourceNodes.push(group);
+        this._sceneObjects.push(group);
       }
     });
 
@@ -551,6 +675,7 @@ export class MapGenerator {
         group.userData   = { type: R_STONE, amount: 25, id: `res_stone_${nodeId++}` };
         this.scene.add(group);
         this._resourceNodes.push(group);
+        this._sceneObjects.push(group);
       }
     });
   }
@@ -564,6 +689,7 @@ export class MapGenerator {
     );
     mesh.position.set(18, 0.05, -8);
     this.scene.add(mesh);
+    this._sceneObjects.push(mesh);
   }
 
   _placeTrees() {
@@ -584,6 +710,7 @@ export class MapGenerator {
       g.position.set(x, 0, z);
       g.castShadow = true;
       this.scene.add(g);
+      this._sceneObjects.push(g);
     });
   }
 }
