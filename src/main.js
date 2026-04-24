@@ -25,6 +25,8 @@ settlement.spawnHall(mapGen.getSpawnPoint());
 const citizenSystem = new CitizenSystem(renderer.getScene(), gameState);
 citizenSystem.spawnStartingCitizens(mapGen.getSpawnPoint());
 
+citizenSystem.registerWoodNodes(mapGen.getResourceNodes());
+
 gameState.setPhase('planning');
 camera.setGameMode();
 
