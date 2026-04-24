@@ -5,30 +5,40 @@ const WALK_SPEED           = 1.2;
 const WANDER_INTERVAL_MIN  = 1.5;
 const WANDER_INTERVAL_MAX  = 4.0;
 const ARRIVAL_THRESHOLD    = 0.3;
-const GATHER_TIME          = 1.5;  // seconds spent at the wood node
-const WOOD_PER_TRIP        = 1;    // wood delivered per run
-const IDLE_BEFORE_ASSIGN   = 0.5;  // seconds idle before auto-assigning
+const GATHER_TIME          = 1.5;
+const WOOD_PER_TRIP        = 5;
+const IDLE_BEFORE_ASSIGN   = 0.5;
 
 const BODY_COLORS = [0xc8855a, 0xb87040, 0xd49060, 0xa06535, 0xcc8055];
 
+const _stumpMat = new THREE.MeshLambertMaterial({ color: 0x5a3a1a });
+
+function _buildStump() {
+  const mesh = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.24, 0.28, 6), _stumpMat);
+  mesh.position.y = 0.14;
+  mesh.castShadow = true;
+  return mesh;
+}
+
 export class CitizenSystem {
   constructor(scene, gameState) {
-    this.scene     = scene;
-    this.gameState = gameState;
-    this._citizens = [];
-    this._hallPos  = { x: 0, z: 0 };
-    this._woodNodes = [];       // { node, reserved: citizenId|null }
+    this.scene      = scene;
+    this.gameState  = gameState;
+    this._citizens  = [];
+    this._hallPos   = { x: 0, z: 0 };
+    this._woodNodes = [];
   }
 
-  // Call once after map resources are available.
   registerWoodNodes(resourceNodes) {
     this._woodNodes = resourceNodes
       .filter(n => n.userData.type === 'wood')
-      .map(n => ({ node: n, reserved: null }));
-  }
-
-  setHallPos(pos) {
-    this._hallPos = { x: pos.x, z: pos.z };
+      .map(n => ({
+        node:      n,
+        state:     'active',
+        remaining: n.userData.amount,
+        max:       n.userData.amount,
+        reserved:  null,
+      }));
   }
 
   spawnStartingCitizens(hallPos, count = 5) {
@@ -64,8 +74,8 @@ export class CitizenSystem {
         _target:      { x, z },
         _wanderTimer: i * 0.7,
         _gatherTimer: 0,
-        _idleTimer:   i * 0.3,   // stagger initial assignment
-        _woodSlot:    null,       // index into this._woodNodes
+        _idleTimer:   i * 0.3,
+        _woodSlot:    null,
       };
 
       this._citizens.push(citizen);
@@ -80,40 +90,21 @@ export class CitizenSystem {
     if (phase !== 'planning') return;
 
     for (const c of this._citizens) {
+      // Recover if reserved slot was depleted while citizen was en-route or gathering
+      if (c._woodSlot !== null && this._woodNodes[c._woodSlot].state === 'depleted') {
+        this._releaseWoodSlot(c);
+        c.state      = 'idle';
+        c._idleTimer = 0;
+      }
+
       switch (c.state) {
-
-        case 'idle':
-          this._updateIdle(c, delta);
-          break;
-
-        case 'moving_to_resource':
-          this._moveTo(c, delta, c._target, () => {
-            c.state        = 'gathering';
-            c._gatherTimer = GATHER_TIME;
-          });
-          break;
-
-        case 'gathering':
-          c._gatherTimer -= delta;
-          if (c._gatherTimer <= 0) {
-            c.state   = 'returning';
-            c._target = { x: this._hallPos.x, z: this._hallPos.z };
-          }
-          break;
-
-        case 'returning':
-          this._moveTo(c, delta, c._target, () => {
-            this.gameState.addResource('wood', WOOD_PER_TRIP);
-            this._releaseWoodSlot(c);
-            c.state      = 'idle';
-            c._idleTimer = 0;  // immediately look for next node
-          });
-          break;
+        case 'idle':               this._updateIdle(c, delta);              break;
+        case 'moving_to_resource': this._updateMovingToResource(c, delta);  break;
+        case 'gathering':          this._updateGathering(c, delta);         break;
+        case 'returning':          this._updateReturning(c, delta);         break;
       }
     }
   }
-
-  // ─── private ────────────────────────────────────────────────────────────────
 
   _updateIdle(c, delta) {
     if (this._woodNodes.length > 0) {
@@ -130,13 +121,40 @@ export class CitizenSystem {
           c.state = 'moving_to_resource';
           return;
         }
-        c._idleTimer = IDLE_BEFORE_ASSIGN;  // retry soon
+        c._idleTimer = IDLE_BEFORE_ASSIGN;
       }
       return;
     }
-
-    // No wood nodes registered yet — fall back to wander
     this._updateWander(c, delta);
+  }
+
+  _updateMovingToResource(c, delta) {
+    this._moveTo(c, delta, c._target, () => {
+      c.state        = 'gathering';
+      c._gatherTimer = GATHER_TIME;
+    });
+  }
+
+  _updateGathering(c, delta) {
+    c._gatherTimer -= delta;
+    if (c._gatherTimer <= 0) {
+      const slot = this._woodNodes[c._woodSlot];
+      slot.remaining = Math.max(0, slot.remaining - WOOD_PER_TRIP);
+      if (slot.remaining <= 0 && slot.state === 'active') {
+        this._depleteNode(c._woodSlot);
+      }
+      this._releaseWoodSlot(c);
+      c.state   = 'returning';
+      c._target = { x: this._hallPos.x, z: this._hallPos.z };
+    }
+  }
+
+  _updateReturning(c, delta) {
+    this._moveTo(c, delta, c._target, () => {
+      this.gameState.addResource('wood', WOOD_PER_TRIP);
+      c.state      = 'idle';
+      c._idleTimer = 0;
+    });
   }
 
   _updateWander(c, delta) {
@@ -167,10 +185,7 @@ export class CitizenSystem {
     const dx   = target.x - c.position.x;
     const dz   = target.z - c.position.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
-    if (dist <= ARRIVAL_THRESHOLD) {
-      onArrival();
-      return;
-    }
+    if (dist <= ARRIVAL_THRESHOLD) { onArrival(); return; }
     const step    = Math.min(WALK_SPEED * delta, dist);
     c.position.x += (dx / dist) * step;
     c.position.z += (dz / dist) * step;
@@ -178,11 +193,28 @@ export class CitizenSystem {
     c.mesh.rotation.y = Math.atan2(dx, dz);
   }
 
+  _depleteNode(slotIdx) {
+    const slot  = this._woodNodes[slotIdx];
+    slot.state    = 'depleted';
+    slot.reserved = null;
+
+    const group = slot.node;
+    while (group.children.length > 0) {
+      const child = group.children[0];
+      group.remove(child);
+      child.geometry.dispose();
+    }
+    group.add(_buildStump());
+    group.userData.state = 'depleted';
+  }
+
   _findNearestFreeWoodSlot(c) {
     let best = null, bestDist = Infinity;
     for (let i = 0; i < this._woodNodes.length; i++) {
-      if (this._woodNodes[i].reserved !== null) continue;
-      const n  = this._woodNodes[i].node;
+      const slot = this._woodNodes[i];
+      if (slot.state !== 'active') continue;
+      if (slot.reserved !== null)  continue;
+      const n  = slot.node;
       const dx = n.position.x - c.position.x;
       const dz = n.position.z - c.position.z;
       const d  = dx * dx + dz * dz;
@@ -193,10 +225,13 @@ export class CitizenSystem {
 
   _releaseWoodSlot(c) {
     if (c._woodSlot !== null && this._woodNodes[c._woodSlot]) {
-      this._woodNodes[c._woodSlot].reserved = null;
+      if (this._woodNodes[c._woodSlot].reserved === c.id) {
+        this._woodNodes[c._woodSlot].reserved = null;
+      }
     }
     c._woodSlot = null;
   }
 
-  getCitizens() { return this._citizens; }
+  getCitizens()  { return this._citizens;  }
+  getWoodNodes() { return this._woodNodes; }
 }
