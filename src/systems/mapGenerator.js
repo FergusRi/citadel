@@ -138,9 +138,11 @@ export class MapGenerator {
     this._slopeValues   = null;       // Float32Array [col + row*cols]
     this._clearings     = [];         // array of clearing objects
     this._clearingMask  = new Set();  // "col,row" keys for fast lookup
-    this._spawnPoint    = null;        // validated world-space { x, z } spawn point
-    this._gridCols      = SEGMENTS + 1;
-    this._gridRows      = SEGMENTS + 1;
+    this._spawnPoint       = null;
+    this._sceneObjects     = [];
+    this._validationResult = null;
+    this._gridCols         = SEGMENTS + 1;
+    this._gridRows         = SEGMENTS + 1;
   }
 
   getSeed() { return this.seed; }
