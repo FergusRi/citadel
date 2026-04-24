@@ -5,6 +5,7 @@ import { GameState } from './systems/gameState.js';
 import { Context } from './context.js';
 import { Settlement } from './systems/settlement.js';
 import { CitizenSystem } from './systems/citizens.js';
+import { BuildingPlacer } from './systems/buildingPlacer.js';
 
 const canvas = document.getElementById('game-canvas');
 
@@ -30,7 +31,11 @@ citizenSystem.registerWoodNodes(mapGen.getResourceNodes());
 gameState.setPhase('planning');
 camera.setGameMode();
 
-export const ctx = new Context({ renderer, camera, gameState, mapGen, settlement, citizenSystem, seed });
+const buildingPlacer = new BuildingPlacer(
+  renderer.getScene(), renderer.getCamera(), canvas, mapGen, gameState
+);
+
+export const ctx = new Context({ renderer, camera, gameState, mapGen, settlement, citizenSystem, buildingPlacer, seed });
 
 let lastTime = 0;
 
