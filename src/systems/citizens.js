@@ -4,10 +4,14 @@ const WANDER_RADIUS        = 5.0;
 const WALK_SPEED           = 1.2;
 const WANDER_INTERVAL_MIN  = 1.5;
 const WANDER_INTERVAL_MAX  = 4.0;
-const ARRIVAL_THRESHOLD    = 0.3;
+const ARRIVAL_THRESHOLD    = 0.35;
 const GATHER_TIME          = 1.5;
 const WOOD_PER_TRIP        = 5;
+const STONE_PER_TRIP       = 3;
 const IDLE_BEFORE_ASSIGN   = 0.5;
+const DEFEND_ATTACK_RANGE  = 2.5;
+const DEFEND_ATTACK_DAMAGE = 5;
+const DEFEND_ATTACK_RATE   = 1.0; // seconds per swing
 
 const BODY_COLORS = [0xc8855a, 0xb87040, 0xd49060, 0xa06535, 0xcc8055];
 
@@ -26,12 +30,23 @@ export class CitizenSystem {
     this.gameState  = gameState;
     this._citizens  = [];
     this._hallPos   = { x: 0, z: 0 };
-    this._woodNodes = [];
+    this._woodNodes  = [];
+    this._stoneNodes = [];
   }
 
   registerWoodNodes(resourceNodes) {
     this._woodNodes = resourceNodes
       .filter(n => n.userData.type === 'wood')
+      .map(n => ({
+        node:      n,
+        state:     'active',
+        remaining: n.userData.amount,
+        max:       n.userData.amount,
+        reserved:  null,
+      }));
+
+    this._stoneNodes = resourceNodes
+      .filter(n => n.userData.type === 'stone')
       .map(n => ({
         node:      n,
         state:     'active',
@@ -76,6 +91,10 @@ export class CitizenSystem {
         _gatherTimer: 0,
         _idleTimer:   i * 0.3,
         _woodSlot:    null,
+        _stoneSlot:   null,
+        _resourceType: null,
+        _guardPost:   null,   // reference to guard post building if assigned
+        _attackTimer: 0,
       };
 
       this._citizens.push(citizen);
@@ -86,45 +105,145 @@ export class CitizenSystem {
     this.gameState.population.max     = count;
   }
 
-  update(delta, phase) {
-    if (phase !== 'planning') return;
+  // Assign a citizen to a guard post (called by buildingPlacer after placing guard post)
+  assignToGuardPost(guardPost) {
+    const unassigned = this._citizens.find(c => c._guardPost === null);
+    if (!unassigned) return null;
+    unassigned._guardPost = guardPost;
+    guardPost.assignedCitizen = unassigned;
+    return unassigned;
+  }
 
+  update(delta, phase) {
+    if (phase === 'game_over') return;
+
+    if (phase === 'wave') {
+      this._updateWavePhase(delta);
+      return;
+    }
+
+    // Planning phase
     for (const c of this._citizens) {
-      // Recover if reserved slot was depleted while citizen was en-route or gathering
+      // Recover if reserved slot was depleted mid-transit
       if (c._woodSlot !== null && this._woodNodes[c._woodSlot].state === 'depleted') {
-        this._releaseWoodSlot(c);
+        this._releaseResourceSlot(c);
+        c.state      = 'idle';
+        c._idleTimer = 0;
+      }
+      if (c._stoneSlot !== null && this._stoneNodes[c._stoneSlot].state === 'depleted') {
+        this._releaseResourceSlot(c);
         c.state      = 'idle';
         c._idleTimer = 0;
       }
 
       switch (c.state) {
-        case 'idle':               this._updateIdle(c, delta);              break;
-        case 'moving_to_resource': this._updateMovingToResource(c, delta);  break;
-        case 'gathering':          this._updateGathering(c, delta);         break;
-        case 'returning':          this._updateReturning(c, delta);         break;
+        case 'idle':               this._updateIdle(c, delta);             break;
+        case 'moving_to_resource': this._updateMovingToResource(c, delta); break;
+        case 'gathering':          this._updateGathering(c, delta);        break;
+        case 'returning':          this._updateReturning(c, delta);        break;
+      }
+    }
+  }
+
+  _updateWavePhase(delta) {
+    for (const c of this._citizens) {
+      if (c._guardPost !== null) {
+        // Move to guard post then defend
+        if (c.state !== 'defending' && c.state !== 'moving_to_guard') {
+          this._releaseResourceSlot(c);
+          c.state   = 'moving_to_guard';
+          c._target = { x: c._guardPost.position.x, z: c._guardPost.position.z };
+        }
+        if (c.state === 'moving_to_guard') {
+          this._moveTo(c, delta, c._target, () => { c.state = 'defending'; });
+        }
+        if (c.state === 'defending') {
+          this._updateDefending(c, delta);
+        }
+      } else {
+        // Shelter in town hall
+        if (c.state !== 'sheltering' && c.state !== 'moving_to_shelter') {
+          this._releaseResourceSlot(c);
+          c.state   = 'moving_to_shelter';
+          c._target = { x: this._hallPos.x, z: this._hallPos.z };
+        }
+        if (c.state === 'moving_to_shelter') {
+          this._moveTo(c, delta, c._target, () => {
+            c.state = 'sheltering';
+            c.mesh.visible = false; // hide inside hall
+          });
+        }
+      }
+    }
+  }
+
+  _updateDefending(c, delta) {
+    c._attackTimer -= delta;
+    const enemies = this.gameState.enemies.filter(e => e._alive);
+    if (enemies.length === 0) return;
+
+    // Find nearest enemy in range
+    let nearest = null, nearestDist = Infinity;
+    for (const e of enemies) {
+      const dx = e.position.x - c._guardPost.position.x;
+      const dz = e.position.z - c._guardPost.position.z;
+      const d  = Math.sqrt(dx * dx + dz * dz);
+      if (d < DEFEND_ATTACK_RANGE && d < nearestDist) {
+        nearest = e; nearestDist = d;
+      }
+    }
+
+    if (nearest && c._attackTimer <= 0) {
+      nearest.health -= DEFEND_ATTACK_DAMAGE;
+      c._attackTimer = DEFEND_ATTACK_RATE;
+      if (nearest.health <= 0) nearest._alive = false;
+    }
+  }
+
+  // Resume gathering after wave ends
+  resumeAfterWave() {
+    for (const c of this._citizens) {
+      c.mesh.visible = true;
+      if (c.state === 'sheltering' || c.state === 'defending' ||
+          c.state === 'moving_to_shelter' || c.state === 'moving_to_guard') {
+        c.state      = 'idle';
+        c._idleTimer = Math.random() * 1.0;
       }
     }
   }
 
   _updateIdle(c, delta) {
-    if (this._woodNodes.length > 0) {
-      c._idleTimer -= delta;
-      if (c._idleTimer <= 0) {
-        const slot = this._findNearestFreeWoodSlot(c);
-        if (slot !== null) {
-          this._woodNodes[slot].reserved = c.id;
-          c._woodSlot = slot;
-          c._target   = {
-            x: this._woodNodes[slot].node.position.x,
-            z: this._woodNodes[slot].node.position.z,
-          };
-          c.state = 'moving_to_resource';
-          return;
-        }
-        c._idleTimer = IDLE_BEFORE_ASSIGN;
-      }
+    c._idleTimer -= delta;
+    if (c._idleTimer > 0) { this._updateWander(c, delta); return; }
+
+    // Prefer wood, then stone
+    const woodSlot = this._findNearestFreeSlot(c, this._woodNodes);
+    if (woodSlot !== null) {
+      this._woodNodes[woodSlot].reserved = c.id;
+      c._woodSlot    = woodSlot;
+      c._resourceType = 'wood';
+      c._target = {
+        x: this._woodNodes[woodSlot].node.position.x,
+        z: this._woodNodes[woodSlot].node.position.z,
+      };
+      c.state = 'moving_to_resource';
       return;
     }
+
+    const stoneSlot = this._findNearestFreeSlot(c, this._stoneNodes);
+    if (stoneSlot !== null) {
+      this._stoneNodes[stoneSlot].reserved = c.id;
+      c._stoneSlot    = stoneSlot;
+      c._resourceType = 'stone';
+      c._target = {
+        x: this._stoneNodes[stoneSlot].node.position.x,
+        z: this._stoneNodes[stoneSlot].node.position.z,
+      };
+      c.state = 'moving_to_resource';
+      return;
+    }
+
+    c._idleTimer = IDLE_BEFORE_ASSIGN;
     this._updateWander(c, delta);
   }
 
@@ -137,21 +256,34 @@ export class CitizenSystem {
 
   _updateGathering(c, delta) {
     c._gatherTimer -= delta;
-    if (c._gatherTimer <= 0) {
+    if (c._gatherTimer > 0) return;
+
+    if (c._resourceType === 'wood' && c._woodSlot !== null) {
       const slot = this._woodNodes[c._woodSlot];
       slot.remaining = Math.max(0, slot.remaining - WOOD_PER_TRIP);
-      if (slot.remaining <= 0 && slot.state === 'active') {
-        this._depleteNode(c._woodSlot);
-      }
-      this._releaseWoodSlot(c);
+      if (slot.remaining <= 0 && slot.state === 'active') this._depleteWoodNode(c._woodSlot);
+      this._releaseResourceSlot(c);
+      c._resourceType = null;
       c.state   = 'returning';
       c._target = { x: this._hallPos.x, z: this._hallPos.z };
+      c._carrying = 'wood';
+    } else if (c._resourceType === 'stone' && c._stoneSlot !== null) {
+      const slot = this._stoneNodes[c._stoneSlot];
+      slot.remaining = Math.max(0, slot.remaining - STONE_PER_TRIP);
+      if (slot.remaining <= 0 && slot.state === 'active') this._depleteStoneNode(c._stoneSlot);
+      this._releaseResourceSlot(c);
+      c._resourceType = null;
+      c.state   = 'returning';
+      c._target = { x: this._hallPos.x, z: this._hallPos.z };
+      c._carrying = 'stone';
     }
   }
 
   _updateReturning(c, delta) {
     this._moveTo(c, delta, c._target, () => {
-      this.gameState.addResource('wood', WOOD_PER_TRIP);
+      if (c._carrying === 'wood')  this.gameState.addResource('wood', WOOD_PER_TRIP);
+      if (c._carrying === 'stone') this.gameState.addResource('stone', STONE_PER_TRIP);
+      c._carrying  = null;
       c.state      = 'idle';
       c._idleTimer = 0;
     });
@@ -193,11 +325,10 @@ export class CitizenSystem {
     c.mesh.rotation.y = Math.atan2(dx, dz);
   }
 
-  _depleteNode(slotIdx) {
+  _depleteWoodNode(slotIdx) {
     const slot  = this._woodNodes[slotIdx];
     slot.state    = 'depleted';
     slot.reserved = null;
-
     const group = slot.node;
     while (group.children.length > 0) {
       const child = group.children[0];
@@ -208,10 +339,36 @@ export class CitizenSystem {
     group.userData.state = 'depleted';
   }
 
-  _findNearestFreeWoodSlot(c) {
+  _depleteStoneNode(slotIdx) {
+    const slot  = this._stoneNodes[slotIdx];
+    slot.state    = 'depleted';
+    slot.reserved = null;
+    const group = slot.node;
+    while (group.children.length > 0) {
+      const child = group.children[0];
+      group.remove(child);
+      child.geometry.dispose();
+    }
+    group.userData.state = 'depleted';
+  }
+
+  _releaseResourceSlot(c) {
+    if (c._woodSlot !== null && this._woodNodes[c._woodSlot]) {
+      if (this._woodNodes[c._woodSlot].reserved === c.id)
+        this._woodNodes[c._woodSlot].reserved = null;
+    }
+    if (c._stoneSlot !== null && this._stoneNodes[c._stoneSlot]) {
+      if (this._stoneNodes[c._stoneSlot].reserved === c.id)
+        this._stoneNodes[c._stoneSlot].reserved = null;
+    }
+    c._woodSlot  = null;
+    c._stoneSlot = null;
+  }
+
+  _findNearestFreeSlot(c, nodes) {
     let best = null, bestDist = Infinity;
-    for (let i = 0; i < this._woodNodes.length; i++) {
-      const slot = this._woodNodes[i];
+    for (let i = 0; i < nodes.length; i++) {
+      const slot = nodes[i];
       if (slot.state !== 'active') continue;
       if (slot.reserved !== null)  continue;
       const n  = slot.node;
@@ -223,15 +380,7 @@ export class CitizenSystem {
     return best;
   }
 
-  _releaseWoodSlot(c) {
-    if (c._woodSlot !== null && this._woodNodes[c._woodSlot]) {
-      if (this._woodNodes[c._woodSlot].reserved === c.id) {
-        this._woodNodes[c._woodSlot].reserved = null;
-      }
-    }
-    c._woodSlot = null;
-  }
-
-  getCitizens()  { return this._citizens;  }
-  getWoodNodes() { return this._woodNodes; }
+  getCitizens()   { return this._citizens;   }
+  getWoodNodes()  { return this._woodNodes;  }
+  getStoneNodes() { return this._stoneNodes; }
 }
